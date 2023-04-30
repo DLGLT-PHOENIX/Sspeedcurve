@@ -1,0 +1,334 @@
+#include "S_speed_curve.h"
+#include"math.h"
+#include <string.h>
+#include "cmsis_os.h"
+
+/*************************** Dongguan-University of Technology -ACE**************************
+ * @file    S_speed_curve.c
+ * @author  陈庆澄
+ * @version V1.0.1
+ * @date    2023/4/27
+ * @brief
+ ******************************************************************************
+ * @verbatim
+ 使用前需要在SspeedcurveInit函数中确定几个变量：
+ 速度目标值v_target
+最大加速度a_max
+设定运行距离s_target
+Sspeedcurvecal 需获取当前速度亦即是初速度值(actualvalue=v_start)，还有目标运行距离s_target
+
+Ssc->j_cur
+Ssc->v_cur
+Ssc->a_cur
+Ssc->s_cur  四个变量 为计算后的变量，实际使用只需要v_cur ,其他三个变量可以在仿真调试时拿出来观察
+
+
+L >= s_target,达不到目标速度(即无匀加速段),需要规划出实际最大速度,需用二分法不断趋近算出v_max，但需进入循环，暂时没有想出解决办法
+由于暂时只使用在P轴上，所以暂时的办法是仅保留L<s_target的情况，通过调参确定以上的变量
+ * @attention
+ * 在循环中使用二分法可能会过量占用CPU时间，看看能不能用任务分配时间片的方式优化
+ * 在使用二分法计算v_max时，v_end为末速度，但暂时没有想到如何获取每个motion的末速度
+ ************************** Dongguan-University of Technology -ACE***************************/
+
+/*--------------------函数声明-----------------------*/
+static fp32 Sspeedcurvecal(Sspeedcurve_para_t *Ssc,fp32 v_start,fp32 s_target);
+static void SspeedcurveInit(Sspeedcurve_para_t *Ssc,fp32 s_target,fp32 a_max,fp32 j,fp32 v_target);
+
+/*---------------------------------------------------------*/
+
+
+
+/*---------------------------------------------------------*/
+/**
+ * @brief          Sspeedcurve初始化
+ * @param[in]      初始化的Sspeedcurve结构体
+ * @param[in]      Ssc的v_target
+ * @param[in]      Ssc的s_target
+ * @param[in]      Ssc的a_max
+ * @retval         none
+ */
+void SspeedcurveInit(Sspeedcurve_para_t *Ssc,fp32 s_target,fp32 a_max,fp32 j,fp32 v_target)
+{
+   memset(Ssc, 0, sizeof(Sspeedcurve_para_t));
+   Ssc->a_max=a_max;            //自给适合的
+   Ssc->v_target=v_target;        //设定值
+   Ssc->j=j;                    //通过调参确定最近加加速度
+   
+}
+
+fp32 Sspeedcurvecal(Sspeedcurve_para_t *Ssc,fp32 v_start,fp32 s_target) //
+{
+    Ssc->v_start=v_start;          //v_start从电调上获取actualvalue
+    Ssc->v_end=v_start;         //
+    Ssc->s_target=s_target;       //按p轴要运行的距离设定
+    uint16_t   flag0 =0;        //二分法时使用
+    uint16_t   flag1 =0;
+    
+    static int32_t T;         // 运行时间
+    T= xTaskGetTickCount();
+    // if (Ssc->v_max == 0)         //只有第一遍
+            {
+                /***********************************根据目标速度,加速度,加加速度等规划出加速区和减速区******************/
+                if ((Ssc->v_target - Ssc->v_start) > Ssc->a_target * Ssc->a_target / Ssc->j) //匀加速段
+                {
+                    Ssc->a_max = Ssc->a_target;
+
+                    Ssc->t[1] = Ssc->a_max / Ssc->j;
+                    Ssc->v[1] = Ssc->v_start + 0.5f * Ssc->j * Ssc->t[1] * Ssc->t[1];
+                    Ssc->s[1] = Ssc->v_start * Ssc->t[1] + (Ssc->j * Ssc->t[1] * Ssc->t[1] * Ssc->t[1]) / 6;
+
+                    Ssc->t[2] = (Ssc->v_target - Ssc->v_start) / Ssc->a_max - Ssc->t[1];
+                    Ssc->v[2] = Ssc->v[1] + Ssc->a_target * Ssc->t[2];
+                    Ssc->s[2] = Ssc->v[1] * Ssc->t[2] + 0.5f * Ssc->a_max * Ssc->t[2] * Ssc->t[2];
+
+                    Ssc->t[3] = Ssc->t[1];
+                    Ssc->v[3] = Ssc->v[2] + Ssc->a_max * Ssc->t[3] - 0.5f * Ssc->j * Ssc->t[3] * Ssc->t[3];
+                    Ssc->s[3] = Ssc->v[2] * Ssc->t[2] + Ssc->j * Ssc->t[3] * Ssc->t[3] * Ssc->t[3] / 3;
+                }
+                else
+                {
+                    Ssc->a_max = sqrt((Ssc->v_target - Ssc->v_start) * Ssc->j);
+                    Ssc->t[1] = sqrt((Ssc->v_target - Ssc->v_start) / Ssc->j);
+                    Ssc->s[1] = Ssc->v_start * Ssc->t[1] + (Ssc->j * Ssc->t[1] * Ssc->t[1] * Ssc->t[1]) / 6;
+                    Ssc->v[1] = Ssc->v_start + 0.5f * Ssc->j * Ssc->t[1] * Ssc->t[1];
+                    Ssc->t[2] = 0;
+                    Ssc->v[2] = Ssc->v[1];
+                    Ssc->s[1] = 0;
+                    Ssc->t[3] = Ssc->t[1];
+                    Ssc->s[3] = Ssc->v[2] * Ssc->t[3] + Ssc->j * Ssc->t[3] * Ssc->t[3] * Ssc->t[3] / 3;
+                    Ssc->v[3] = Ssc->v[2] + Ssc->a_max * Ssc->t[3] - 0.5f * Ssc->j * Ssc->t[3] * Ssc->t[3];
+                }
+                if (Ssc->v_target - Ssc->v_end > (Ssc->d_target * Ssc->d_target) / Ssc->j)
+                {
+                    Ssc->d_max = Ssc->d_target;
+
+                    Ssc->t[7] = Ssc->d_max / Ssc->j;
+                    Ssc->s[7] = Ssc->v_end * Ssc->t[7] + (Ssc->j * Ssc->t[7] * Ssc->t[7] * Ssc->t[7]) / 6;
+                    Ssc->v[6] = Ssc->v_end + 0.5f * Ssc->j * Ssc->t[7] * Ssc->t[7];
+                    Ssc->t[6] = (Ssc->v_target - Ssc->v_end) / Ssc->d_max - Ssc->t[7];
+                    Ssc->s[6] = Ssc->v[6] * Ssc->t[6] + 0.5f * Ssc->d_max * Ssc->t[6] * Ssc->t[6];
+                    Ssc->v[5] = Ssc->v[6] + Ssc->d_target * Ssc->t[6];
+                    Ssc->t[5] = Ssc->t[7];
+                    Ssc->s[5] = Ssc->v[5] * Ssc->t[5] + Ssc->j * Ssc->t[5] * Ssc->t[5] * Ssc->t[5] / 3;
+                }
+                else
+                {
+                    Ssc->d_max = sqrt((Ssc->v_target - Ssc->v_end) * Ssc->j);
+                    Ssc->t[7] = sqrt((Ssc->v_target - Ssc->v_end) / Ssc->j);
+                    Ssc->s[7] = Ssc->v_end * Ssc->t[7] + (Ssc->j * Ssc->t[7] * Ssc->t[7] * Ssc->t[7]) / 6;
+                    Ssc->v[6] = Ssc->v_end + 0.5f * Ssc->j * Ssc->t[7] * Ssc->t[7];
+                    Ssc->t[6] = 0;
+                    Ssc->s[6] = 0;
+                    Ssc->t[5] = Ssc->t[7];
+                    Ssc->v[5] = Ssc->v[6];
+                    Ssc->s[5] = Ssc->v[3] * Ssc->t[5] - Ssc->j * Ssc->t[5] * Ssc->t[5] * Ssc->t[5] / 6;
+                }
+
+                Ssc->L = 0.5f * ((Ssc->v_start + Ssc->v_target) * (Ssc->t[1] + Ssc->t[2] + Ssc->t[3]) + (Ssc->v_end + Ssc->v_target) * (Ssc->t[5] + Ssc->t[6] + Ssc->t[7]));  //匀变速运动，平均速度*时间=位移
+
+            }
+                
+      /*      if (Ssc->L >= Ssc->s_target )      //如果 L >= s_target,那么达不到目标速度,需要规划出实际最大速度
+            {
+                Ssc->t[4] = 0;
+                Ssc->s[4] = 0;
+                Ssc->v[4] = Ssc->v[3];
+
+                Ssc->v_high = Ssc->v_target;
+
+                初速度较大
+                if (Ssc->v_start > Ssc->v_end)
+                {
+                    Ssc->v_low = Ssc->v_start;
+                }
+                末速度较大
+                else if (Ssc->v_end > Ssc->v_start)
+                {
+                    Ssc->v_low = Ssc->v_end;
+                }
+
+                Ssc->v_max = 0.5f * (Ssc->v_low + Ssc->v_high);
+            }  */
+            /*如果 L < s_target 那么可以正常进行规划(有匀速段),标志位flag1=1*/
+             if (Ssc->L < Ssc->s_target)
+            {
+                Ssc->v_max = Ssc->v_target;
+                flag1 = 1;
+            }
+
+             /***********************************  根据二分处理后的速度再算位移  ******************/
+         /*   if ((Ssc->v_max - Ssc->v_start) > Ssc->a_target * Ssc->a_target / Ssc->j) //匀加速段
+            {
+                Ssc->a_max = Ssc->a_target;
+
+                Ssc->t[1] = Ssc->a_max / Ssc->j;
+                Ssc->v[1] = Ssc->v_start + 0.5f * Ssc->j * Ssc->t[1] * Ssc->t[1];
+                Ssc->s[1] = Ssc->v_start * Ssc->t[1] + (Ssc->j * Ssc->t[1] * Ssc->t[1] * Ssc->t[1]) / 6;
+
+                Ssc->t[2] = (Ssc->v_max - Ssc->v_start) / Ssc->a_max - Ssc->t[1];
+                Ssc->v[2] = Ssc->v[1] + Ssc->a_target * Ssc->t[2];
+                Ssc->s[2] = Ssc->v[1] * Ssc->t[2] + 0.5f * Ssc->a_max * Ssc->t[2] * Ssc->t[2];
+
+                Ssc->t[3] = Ssc->t[1];
+                Ssc->v[3] = Ssc->v[2] + Ssc->a_max * Ssc->t[3] - 0.5f * Ssc->j * Ssc->t[3] * Ssc->t[3];
+                Ssc->s[3] = Ssc->v[2] * Ssc->t[3] + Ssc->j * Ssc->t[3] * Ssc->t[3] * Ssc->t[3] / 3;
+            }
+            else
+            {
+                Ssc->a_max = sqrt((Ssc->v_max - Ssc->v_start) * Ssc->j);
+                Ssc->t[1] = sqrt((Ssc->v_max - Ssc->v_start) / Ssc->j);
+                Ssc->s[1] = Ssc->v_start * Ssc->t[1] + (Ssc->j * Ssc->t[1] * Ssc->t[1] * Ssc->t[1]) / 6;
+                Ssc->v[1] = Ssc->v_start + 0.5f * Ssc->j * Ssc->t[1] * Ssc->t[1];
+                Ssc->t[2] = 0;
+                Ssc->v[2] = Ssc->v[1];
+                Ssc->s[2] = 0;
+                Ssc->t[3] = Ssc->t[1];
+                Ssc->s[3] = Ssc->v[2] * Ssc->t[3] + Ssc->j * Ssc->t[3] * Ssc->t[3] * Ssc->t[3] / 3;
+                Ssc->v[3] = Ssc->v[2] + Ssc->a_max * Ssc->t[3] - 0.5f * Ssc->j * Ssc->t[3] * Ssc->t[3];
+            }
+            if (Ssc->v_max - Ssc->v_end > (Ssc->d_target * Ssc->d_target) / Ssc->j)  //匀减速段
+            {
+                Ssc->d_max = Ssc->d_target;
+
+                Ssc->t[7] = Ssc->d_max / Ssc->j;
+                Ssc->s[7] = Ssc->v_end * Ssc->t[7] + (Ssc->j * Ssc->t[7] * Ssc->t[7] * Ssc->t[7]) / 6;
+                Ssc->v[6] = Ssc->v_end + 0.5f * Ssc->j * Ssc->t[7] * Ssc->t[7];
+                Ssc->t[6] = (Ssc->v_max - Ssc->v_end) / Ssc->d_max - Ssc->t[7];
+                Ssc->s[6] = Ssc->v[6] * Ssc->t[6] + 0.5f * Ssc->d_max * Ssc->t[6] * Ssc->t[6];
+                Ssc->v[5] = Ssc->v[6] + Ssc->d_target * Ssc->t[6];
+                Ssc->t[5] = Ssc->t[7];
+                Ssc->s[5] = Ssc->v[5] * Ssc->t[5] + Ssc->j * Ssc->t[5] * Ssc->t[5] * Ssc->t[5] / 3;
+            }
+            else
+            {
+                Ssc->d_max = sqrt((Ssc->v_max - Ssc->v_end) * Ssc->j);
+                Ssc->t[7] = sqrt((Ssc->v_max - Ssc->v_end) / Ssc->j);
+                Ssc->s[7] = Ssc->v_end * Ssc->t[7] + (Ssc->j * Ssc->t[7] * Ssc->t[7] * Ssc->t[7]) / 6;
+                Ssc->v[6] = Ssc->v_end + 0.5f * Ssc->j * Ssc->t[7] * Ssc->t[7];
+                Ssc->t[6] = 0;
+                Ssc->s[6] = 0;
+                Ssc->t[5] = Ssc->t[7];
+                Ssc->v[5] = Ssc->v[6];
+                Ssc->s[5] = Ssc->v[3] * Ssc->t[5] - Ssc->j * Ssc->t[5] * Ssc->t[5] * Ssc->t[5] / 6;
+            }
+
+            Ssc->s_max = Ssc->s[1] + Ssc->s[2] + Ssc->s[3] + Ssc->s[5] + Ssc->s[6] + Ssc->s[7];      */  //s_max是二分后的位移
+
+          /*  二分后的位移无限接近目标位移,则标志位flag=1,开始规划
+            if (Ssc->s_max - Ssc->s_target < 0.001f && Ssc->s_max - Ssc->s_target > 0)
+            {
+                flag0 = 1;
+            }
+            否则继续二分
+            else
+            {
+                //二分法思想：不断改变上下限，趋近零点，需进循环
+                if (Ssc->s_max < Ssc->s_target)                   //如果规划出来的位移偏小
+                {
+                    Ssc->v_low = Ssc->v_max;
+                }
+                else {                                  //如果规划出来的位移偏大
+                    Ssc->v_high = Ssc->v_max;
+                }
+                Ssc->v_max = 0.5f * (Ssc->v_low + Ssc->v_high);
+            }  */
+
+
+              /***********************************  只有在标志位置位时才规划(画图)  ******************/
+            if (flag0 == 1 || flag1 == 1)
+            {
+                if (flag1 == 1 )
+                {
+                    /*正常进行规划*/
+                    Ssc->t[4] = (Ssc->s_target - Ssc->L) / Ssc->v_max;
+                    Ssc->v[4] = Ssc->v[3];
+                    Ssc->s[4] = Ssc->v[4] * Ssc->t[4];
+                }
+                else if (flag0 == 1)
+                {
+                    Ssc->t[4] = 0;
+                    Ssc->v[4] = Ssc->v[3];
+                    Ssc->s[4] = 0;
+                }
+
+
+    //            Ssc->T_sum = Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] + Ssc->t[5] + Ssc->t[6] + Ssc->t[7]; //七段时间总和
+
+                if (T >= 0 && T < Ssc->t[1]) //在t1时间段里
+                {
+     //               Ssc->j_cur = Ssc->j;
+     //               Ssc->a_cur = Ssc->j_cur * T;
+                    Ssc->v_cur = Ssc->v_start + 0.5f * Ssc->j_cur * T * T;
+     //               Ssc->s_cur = Ssc->v_start * T + Ssc->j_cur * T * T * T / 6;
+                }
+                else if (T >= Ssc->t[1] && T < Ssc->t[1] + Ssc->t[2] && Ssc->t[2] != 0) //在t2时间段里
+                {
+     //               Ssc->j_cur = 0;
+      //              Ssc->a_cur = Ssc->a_max;
+                    Ssc->v_cur = Ssc->v[1] + Ssc->a_cur * (T - Ssc->t[1]);
+       //             Ssc->s_cur = Ssc->s[1] + Ssc->v[1] * (T - Ssc->t[1]) + 0.5f * Ssc->a_cur * (T - Ssc->t[1]) * (T - Ssc->t[1]);
+
+
+                }
+                else if (T >= Ssc->t[1] + Ssc->t[2] && T < Ssc->t[1] + Ssc->t[2] + Ssc->t[3])   //在t3时间段里
+                {
+     //               Ssc->j_cur = - Ssc->j;
+     //               Ssc->a_cur = Ssc->a_max - Ssc->j * (T - Ssc->t[1] - Ssc->t[2]);
+                    Ssc->v_cur = Ssc->v[2] + Ssc->a_max * (T - Ssc->t[1] - Ssc->t[2]) - 0.5f * Ssc->j * (T - Ssc->t[1] - Ssc->t[2]) * (T - Ssc->t[1] - Ssc->t[2]);
+      //              Ssc->s_cur = Ssc->s[1] + Ssc->s[2] + Ssc->v[2] * (T - Ssc->t[1] - Ssc->t[2]) + 0.5f * Ssc->a_max * (T - Ssc->t[1] - Ssc->t[2]) * (T - Ssc->t[1] - Ssc->t[2]) - Ssc->j * (T - Ssc->t[1] - Ssc->t[2]) * (T - Ssc->t[1] - Ssc->t[2]) * (T - Ssc->t[1] - Ssc->t[2]) / 6;
+
+
+                }
+                else if (T >= Ssc->t[1] + Ssc->t[2] + Ssc->t[3] && T < Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] && Ssc->t[4] != 0)     //在t4时间段里
+                {
+       //             Ssc->j_cur = 0;
+        //            Ssc->a_cur = 0;
+                    Ssc->v_cur = Ssc->v[3];
+   //                 Ssc->s_cur = Ssc->s[1] + Ssc->s[2] + Ssc->s[3] + Ssc->v[3] * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3]);
+
+                }
+                else if (T >= Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] && T < Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] + Ssc->t[5])       //在t5时间段里
+                {
+       //             Ssc->j_cur = - Ssc->j;
+        //            Ssc->a_cur = - Ssc->j * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4]);
+                    Ssc->v_cur = Ssc->v[4] - 0.5f * Ssc->j * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4]);
+       //             Ssc->s_cur = Ssc->s[1] + Ssc->s[2] + Ssc->s[3] + Ssc->s[4] + Ssc->v[4] * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4]) - Ssc->j * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4]) / 6;
+
+
+                }
+                else if (T >= Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] + Ssc->t[5] && T < Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] + Ssc->t[5] + Ssc->t[6] && Ssc->t[6] != 0)
+                {
+        //            Ssc->j_cur = 0;
+        //            Ssc->a_cur = - Ssc->d_max;
+                    Ssc->v_cur = Ssc->v[5] - Ssc->d_target * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5]);
+      //              Ssc->s_cur = Ssc->s[1] + Ssc->s[2] + Ssc->s[3] + Ssc->s[4] + Ssc->s[5] + Ssc->v[5] * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5]) - 0.5f * Ssc->d_target * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5]);
+
+                }
+                else if (T >= Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] + Ssc->t[5] + Ssc->t[6] && T < Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] + Ssc->t[5] + Ssc->t[6] + Ssc->t[7])
+                {
+     //               Ssc->j_cur = Ssc->j;
+     //               Ssc->a_cur = - Ssc->d_max + Ssc->j * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]);
+                    Ssc->v_cur = Ssc->v[6] - Ssc->d_max * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) + 0.5f * Ssc->j * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]);
+  //                  Ssc->s_cur = Ssc->s[1] + Ssc->s[2] + Ssc->s[3] + Ssc->s[4] + Ssc->s[5] + Ssc->s[6] + Ssc->v[6] * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) - 0.5f * Ssc->d_max * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) + Ssc->j * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) * (T - Ssc->t[1] - Ssc->t[2] - Ssc->t[3] - Ssc->t[4] - Ssc->t[5] - Ssc->t[6]) / 6;
+
+                }
+                else if (T > Ssc->t[1] + Ssc->t[2] + Ssc->t[3] + Ssc->t[4] + Ssc->t[5] + Ssc->t[6] + Ssc->t[7])     //运行时间>曲线运动用的时间，出error
+                {
+ //                   Ssc->a_cur = 0;
+   //                 Ssc->j_cur = 0;
+                    Ssc->v_cur = Ssc->v_end;
+                    return 0;
+                }
+         
+            }
+     return Ssc->v_cur ;  
+}
+
+        
+
+
+
+           
+
+
+          
